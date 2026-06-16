@@ -1,0 +1,41 @@
+[package]
+name = "nest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.34.3"
+egui = "0.34.3"
+log = "0.4.32"
+rfd = "0.17.2"
+usvg = "0.47.0"
+
+# Native-only: real multithreading + a logger.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.10"
+env_logger = "0.11"
+
+# Browser/wasm support.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Url",
+    "HtmlAnchorElement",
+    "Blob",
+    "BlobPropertyBag",
+] }
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Faster iterative dev builds of the heavy geometry deps.
+[profile.dev.package."*"]
+opt-level = 2
