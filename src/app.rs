@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use crate::geometry::{Aabb, Polygon, Pt};
-use crate::model::{NestConfig, Part, RotationMode, Unit};
+use crate::model::{NestConfig, NestResult, Part, RotationMode, Unit};
 use crate::svg;
 use crate::worker::Engine;
 
@@ -32,6 +32,11 @@ pub struct NestApp {
     units: Unit,
     /// DPI assumed for SVGs that don't declare physical units (default 96).
     import_dpi: f64,
+
+    // Cached snapshot of the engine's best result, refreshed only when a new
+    // generation is published — avoids cloning the whole layout every frame.
+    cached_best: Option<NestResult>,
+    cached_gen: u64,
 
     imports: ImportQueue,
     status: String,
@@ -65,6 +70,8 @@ impl Default for NestApp {
             rot_free: false,
             units: Unit::Mm,
             import_dpi: 96.0,
+            cached_best: None,
+            cached_gen: u64::MAX,
             imports: Arc::new(Mutex::new(Vec::new())),
             status: "Add parts and a sheet, then press Start.".to_string(),
         }
@@ -156,6 +163,9 @@ impl NestApp {
         self.sync_rotation();
         self.engine
             .start(self.parts.clone(), self.config.clone());
+        // Force the cache to refresh against the fresh run.
+        self.cached_best = None;
+        self.cached_gen = u64::MAX;
         self.status = "Running…".into();
     }
 }
@@ -173,6 +183,13 @@ impl eframe::App for NestApp {
         if self.engine.invalid() {
             self.status =
                 "Nothing to nest: add at least one part and one sheet.".into();
+        }
+
+        // Refresh the cached result only when a new generation is published.
+        let generation = self.engine.generation();
+        if generation != self.cached_gen {
+            self.cached_best = self.engine.best();
+            self.cached_gen = generation;
         }
 
         egui::Panel::top("top").show_inside(ui, |ui| {
@@ -193,7 +210,7 @@ impl eframe::App for NestApp {
                 }
                 ui.separator();
                 ui.label(format!("gen {}", self.engine.generation()));
-                if let Some(best) = self.engine.best() {
+                if let Some(best) = &self.cached_best {
                     ui.separator();
                     ui.label(format!(
                         "placed {} · unplaced {} · sheets {}",
@@ -379,7 +396,7 @@ impl NestApp {
     }
 
     fn canvas_ui(&mut self, ui: &mut egui::Ui) {
-        let best = self.engine.best();
+        let best = self.cached_best.as_ref();
         let mut slots = self.engine.slots();
 
         // Before a run, preview the sheets defined in the current part list.
@@ -454,7 +471,7 @@ impl NestApp {
         }
 
         // Placed parts.
-        if let Some(best) = &best {
+        if let Some(best) = best {
             for pl in &best.placements {
                 let fill = egui::Color32::from_rgba_unmultiplied(
                     pl.color[0],
