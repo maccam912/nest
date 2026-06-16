@@ -43,6 +43,9 @@ pub struct Nester {
     instances: Vec<Instance>,
     slots: Vec<SheetSlot>,
     config: NestConfig,
+    /// Per-slot flag: the sheet is an axis-aligned, hole-free rectangle, so a
+    /// part whose origin lies in the scan range is guaranteed to be contained.
+    slot_is_rect: Vec<bool>,
     population: Vec<Genome>,
     angles: Vec<f64>,
     rng: Rng,
@@ -87,12 +90,14 @@ impl Nester {
         let angles = config.rotation.angles();
         let ready = !instances.is_empty() && !slots.is_empty();
         let rng = Rng::new(config.seed);
+        let slot_is_rect = slots.iter().map(|s| is_axis_rect(&s.polygon)).collect();
 
         let mut nester = Self {
             parts,
             instances,
             slots,
             config,
+            slot_is_rect,
             population: Vec::new(),
             angles,
             rng,
@@ -275,15 +280,29 @@ impl Nester {
     /// Evaluate every genome, sort the population best-first, and update `best`.
     fn evaluate_and_select(&mut self, force_best: bool) {
         let results = self.evaluate_population();
-        // Sort population by fitness, descending.
-        let mut idx: Vec<usize> = (0..self.population.len()).collect();
-        idx.sort_by(|&a, &b| results[b].fitness.partial_cmp(&results[a].fitness).unwrap());
-        let new_pop: Vec<Genome> = idx.iter().map(|&i| self.population[i].clone()).collect();
-        self.population = new_pop;
 
-        let best_idx = idx[0];
+        // Capture the best result before reordering. Pick the *first* genome that
+        // attains the max fitness (matches the stable-sort tie-break used below).
+        let mut best_idx = 0;
+        for i in 1..results.len() {
+            if results[i].fitness > results[best_idx].fitness {
+                best_idx = i;
+            }
+        }
         let mut best = results[best_idx].clone();
         best.generation = self.generation;
+
+        // Reorder the population best-first by *moving* genomes (no per-genome
+        // clone). `results` is in population order, so the zip stays aligned, and
+        // a stable sort preserves the original order among equal-fitness genomes.
+        let mut paired: Vec<(f64, Genome)> = std::mem::take(&mut self.population)
+            .into_iter()
+            .zip(results.iter().map(|r| r.fitness))
+            .map(|(g, f)| (f, g))
+            .collect();
+        paired.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        self.population = paired.into_iter().map(|(_, g)| g).collect();
+
         if force_best || best.fitness > self.best.fitness {
             self.best = best;
         }
@@ -314,7 +333,7 @@ impl Nester {
             let mut done = false;
             for (si, slot) in self.slots.iter().enumerate() {
                 if let Some((dx, dy)) =
-                    self.find_position(&oriented, slot, &per_sheet[si])
+                    self.find_position(&oriented, slot, self.slot_is_rect[si], &per_sheet[si])
                 {
                     let mut poly = oriented.poly.clone();
                     poly.translate(dx, dy);
@@ -362,6 +381,7 @@ impl Nester {
         &self,
         oriented: &Oriented,
         slot: &SheetSlot,
+        slot_is_rect: bool,
         placed: &[Placed],
     ) -> Option<(f64, f64)> {
         let step = self.config.grid_step.max(0.25);
@@ -377,40 +397,50 @@ impl Nester {
             return None;
         }
 
+        // One scratch polygon, re-filled in place for each candidate position
+        // instead of cloning+translating the part on every grid cell.
+        let mut moved = oriented.poly.clone();
         let mut y = y0;
         while y <= y1 + 1e-9 {
             let mut x = x0;
             while x <= x1 + 1e-9 {
-                if self.feasible(oriented, x, y, slot, placed) {
-                    return Some((x, y));
+                translate_into(&mut moved, &oriented.poly, x, y);
+                // Candidate bbox is just the part's bbox shifted by (x, y); float
+                // addition is monotonic, so this equals recomputing it from points.
+                let cand = Aabb {
+                    min: Pt::new(oriented.bounds.min.x + x, oriented.bounds.min.y + y),
+                    max: Pt::new(oriented.bounds.max.x + x, oriented.bounds.max.y + y),
+                };
+                match self.first_blocker(&moved, cand, slot, slot_is_rect, placed) {
+                    None => return Some((x, y)),
+                    // A placed part blocks this x; no origin in [x, skip) can fit
+                    // past it, so jump there (but always advance at least a step).
+                    Some(skip) => x = skip.max(x + step),
                 }
-                x += step;
             }
             y += step;
         }
         None
     }
 
-    fn feasible(
+    /// `None` => the part fits at this position. `Some(skip_x)` => it doesn't, and
+    /// no origin x in `[current, skip_x)` can fit either, so the scan may jump to
+    /// `skip_x`. A containment failure returns a sentinel below the current x,
+    /// which the caller turns into an ordinary one-step advance.
+    fn first_blocker(
         &self,
-        oriented: &Oriented,
-        dx: f64,
-        dy: f64,
+        moved: &Polygon,
+        cand: Aabb,
         slot: &SheetSlot,
+        slot_is_rect: bool,
         placed: &[Placed],
-    ) -> bool {
-        // Candidate bounding box, used as a fast rejection gate below.
-        let cand = Aabb {
-            min: Pt::new(oriented.bounds.min.x + dx, oriented.bounds.min.y + dy),
-            max: Pt::new(oriented.bounds.max.x + dx, oriented.bounds.max.y + dy),
-        };
-
-        let mut moved = oriented.poly.clone();
-        moved.translate(dx, dy);
-
-        // Must sit inside the sheet with the edge margin.
-        if !contained_with_margin(&moved, &slot.polygon, self.config.edge_spacing) {
-            return false;
+    ) -> Option<f64> {
+        // Containment: for an axis-aligned, hole-free rectangle the scan range
+        // already guarantees it, so skip the full edge-intersection test entirely.
+        if !slot_is_rect
+            && !contained_with_margin(moved, &slot.polygon, self.config.edge_spacing)
+        {
+            return Some(f64::NEG_INFINITY); // no useful jump; step normally
         }
 
         // Must respect the part-to-part spacing against everything placed.
@@ -418,16 +448,16 @@ impl Nester {
             if cand.separated_by(&p.bounds, self.config.part_spacing) {
                 continue;
             }
-            if polygons_overlap(&moved, &p.poly) {
-                return false;
-            }
-            if self.config.part_spacing > 0.0
-                && polygon_gap(&moved, &p.poly) < self.config.part_spacing
+            if polygons_overlap(moved, &p.poly)
+                || (self.config.part_spacing > 0.0
+                    && polygon_gap(moved, &p.poly) < self.config.part_spacing)
             {
-                return false;
+                // The part's origin must clear this blocker's right edge (plus the
+                // gap) before it can possibly fit; jump straight there.
+                return Some(p.bounds.max.x + self.config.part_spacing);
             }
         }
-        true
+        None
     }
 
     /// Physics-style settling: nudge each placed part toward the sheet origin in
@@ -542,6 +572,34 @@ impl Nester {
     }
 }
 
+/// Is this polygon an axis-aligned rectangle with no holes? Such sheets need no
+/// per-cell containment test — the grid scan range alone keeps parts inside.
+fn is_axis_rect(poly: &Polygon) -> bool {
+    if !poly.holes.is_empty() || poly.outer.len() != 4 {
+        return false;
+    }
+    let p = &poly.outer;
+    // Either edge 0 is horizontal (and they alternate H/V/H/V) or it's vertical.
+    (p[0].y == p[1].y && p[1].x == p[2].x && p[2].y == p[3].y && p[3].x == p[0].x)
+        || (p[0].x == p[1].x && p[1].y == p[2].y && p[2].x == p[3].x && p[3].y == p[0].y)
+}
+
+/// Overwrite `dst` with `src` shifted by `(dx, dy)`, reusing `dst`'s existing
+/// allocations. `dst` must already have the same ring shapes as `src` (clone it
+/// from `src` once up front).
+fn translate_into(dst: &mut Polygon, src: &Polygon, dx: f64, dy: f64) {
+    for (d, s) in dst.outer.iter_mut().zip(&src.outer) {
+        d.x = s.x + dx;
+        d.y = s.y + dy;
+    }
+    for (dh, sh) in dst.holes.iter_mut().zip(&src.holes) {
+        for (d, s) in dh.iter_mut().zip(sh) {
+            d.x = s.x + dx;
+            d.y = s.y + dy;
+        }
+    }
+}
+
 fn same_origin(a: &Polygon, b: &Polygon) -> bool {
     if a.outer.is_empty() || b.outer.is_empty() {
         return false;
@@ -603,6 +661,41 @@ mod tests {
                 assert!(!polygons_overlap(&a.polygon, &b.polygon), "overlap {i},{j}");
                 assert!(polygon_gap(&a.polygon, &b.polygon) >= 2.0 - 1e-6, "too close {i},{j}");
             }
+        }
+    }
+
+    #[test]
+    fn runs_are_reproducible() {
+        // Same parts + config + seed must yield an identical layout every time.
+        // This pins the engine's determinism (relied on by the hot-path
+        // optimizations and by the parallel evaluator preserving order).
+        let make = || {
+            let parts = vec![rect(1, 100.0, 100.0, 1, true), rect(2, 18.0, 18.0, 9, false)];
+            let config = NestConfig {
+                part_spacing: 2.0,
+                edge_spacing: 2.0,
+                rotation: RotationMode::Steps(4),
+                grid_step: 3.0,
+                population: 12,
+                ..Default::default()
+            };
+            let mut nester = Nester::new(parts, config);
+            for _ in 0..8 {
+                nester.step();
+            }
+            nester.best.clone()
+        };
+
+        let a = make();
+        let b = make();
+        assert_eq!(a.placements.len(), b.placements.len());
+        assert_eq!(a.fitness, b.fitness);
+        for (pa, pb) in a.placements.iter().zip(&b.placements) {
+            assert_eq!(pa.part_id, pb.part_id);
+            assert_eq!(pa.sheet_index, pb.sheet_index);
+            assert_eq!(pa.dx, pb.dx);
+            assert_eq!(pa.dy, pb.dy);
+            assert_eq!(pa.rotation, pb.rotation);
         }
     }
 

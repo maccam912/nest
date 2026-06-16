@@ -94,5 +94,6 @@ trunk build --release  # static site in ./dist
 
 - Placement uses a grid-based bottom-left search rather than full no-fit-polygon
   geometry, so the *Grid step* setting trades packing tightness for speed.
-- The live canvas fills concave shapes approximately (correct outlines, minor fill
-  artifacts on concave parts); SVG export is exact.
+- The live canvas fills parts with a proper ear-clipping triangulation, so concave
+  outlines and holes render exactly (no fill spilling outside the shape or covering
+  holes). SVG export is exact too.

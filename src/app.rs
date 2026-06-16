@@ -1,11 +1,13 @@
 //! The egui front-end: part library, settings, run controls and a live canvas.
 
+use std::f64::consts::{PI, TAU};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
 use crate::geometry::{Aabb, Polygon, Pt};
 use crate::model::{NestConfig, NestResult, Part, RotationMode, Unit};
+use crate::rng::Rng;
 use crate::svg;
 use crate::worker::Engine;
 
@@ -40,6 +42,11 @@ pub struct NestApp {
 
     imports: ImportQueue,
     status: String,
+
+    // Mobile/narrow-screen UI: the controls live in a toggleable overlay panel.
+    show_controls: bool,
+    /// Advances each time the Demo button is pressed so repeated taps differ.
+    demo_seed: u64,
 }
 
 const PALETTE: &[[u8; 3]] = &[
@@ -74,6 +81,8 @@ impl Default for NestApp {
             cached_gen: u64::MAX,
             imports: Arc::new(Mutex::new(Vec::new())),
             status: "Add parts and a sheet, then press Start.".to_string(),
+            show_controls: true,
+            demo_seed: 0x1234_5678_9ABC_DEF0,
         }
     }
 }
@@ -167,6 +176,44 @@ impl NestApp {
         self.cached_best = None;
         self.cached_gen = u64::MAX;
         self.status = "Running…".into();
+        // On a phone, collapse the controls overlay so the live canvas shows.
+        self.show_controls = false;
+    }
+
+    /// Populate the part library with an assortment of convex, concave and holed
+    /// shapes so the tool can be demoed without any SVGs on hand.
+    fn demo_fill(&mut self) {
+        // Replace any existing parts but keep (or create) a sheet to nest into.
+        self.parts.retain(|p| p.is_sheet);
+        if !self.parts.iter().any(|p| p.is_sheet) {
+            self.add_rectangle(600.0, 400.0, true, "Sheet".into());
+        }
+
+        let mut rng = Rng::new(self.demo_seed);
+        self.demo_seed = self.demo_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+
+        // Name + shape kind. Mix of convex, concave and one with a hole.
+        let kinds = [
+            "Triangle", "Pentagon", "Hexagon", "Star", "L-block", "Cross", "Washer", "Arrow",
+        ];
+        for (i, name) in kinds.iter().enumerate() {
+            let r = rng.range(28.0, 52.0);
+            let poly = match i {
+                0 => Polygon::from_points(regular(3, r, rng.range(0.0, TAU))),
+                1 => Polygon::from_points(regular(5, r, rng.range(0.0, TAU))),
+                2 => Polygon::from_points(regular(6, r, rng.range(0.0, TAU))),
+                3 => Polygon::from_points(star(5, r, r * 0.45, rng.range(0.0, TAU))),
+                4 => Polygon::from_points(l_block(r * 1.7)),
+                5 => Polygon::from_points(cross(r * 1.6)),
+                6 => washer(r),
+                _ => Polygon::from_points(arrow(r * 2.0, r * 1.3)),
+            };
+            self.add_polygon_part(poly, (*name).into());
+            if let Some(p) = self.parts.last_mut() {
+                p.quantity = rng.below(3) as u32 + 1;
+            }
+        }
+        self.status = "Loaded demo shapes — press Start.".into();
     }
 }
 
@@ -192,8 +239,28 @@ impl eframe::App for NestApp {
             self.cached_gen = generation;
         }
 
+        // Narrow screens (phones) get a touch-friendly, single-column layout: the
+        // controls become a full-width overlay toggled by a ☰ button.
+        let narrow = ui.ctx().content_rect().width() < 560.0;
+        if narrow {
+            let mut style = (*ui.ctx().global_style()).clone();
+            let s = &mut style.spacing;
+            s.interact_size.y = s.interact_size.y.max(30.0);
+            s.button_padding = egui::vec2(8.0, 6.0);
+            s.item_spacing.y = s.item_spacing.y.max(8.0);
+            ui.ctx().set_global_style(style);
+        }
+
         egui::Panel::top("top").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
+            // Wrap so the controls flow onto extra rows instead of clipping on a
+            // narrow viewport.
+            ui.horizontal_wrapped(|ui| {
+                if narrow {
+                    let label = if self.show_controls { "✖ Close" } else { "☰ Controls" };
+                    if ui.button(label).clicked() {
+                        self.show_controls = !self.show_controls;
+                    }
+                }
                 ui.heading("nest");
                 ui.separator();
                 let running = self.engine.is_running();
@@ -204,6 +271,9 @@ impl eframe::App for NestApp {
                 } else if ui.button("⏹ Stop").clicked() {
                     self.engine.stop();
                     self.status = "Stopped.".into();
+                }
+                if ui.add_enabled(!running, egui::Button::new("🎲 Demo")).clicked() {
+                    self.demo_fill();
                 }
                 if ui.button("💾 Export SVG").clicked() {
                     self.export();
@@ -219,20 +289,31 @@ impl eframe::App for NestApp {
                         best.sheets_used
                     ));
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.status);
-                });
+                ui.separator();
+                ui.label(&self.status);
             });
         });
 
-        egui::Panel::left("controls")
-            .resizable(true)
-            .default_size(320.0)
-            .show_inside(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    self.controls_ui(ui);
+        if narrow {
+            // Full-width slide-in overlay; collapsing it reveals the canvas.
+            egui::Panel::left("controls")
+                .resizable(false)
+                .exact_size(ui.available_width())
+                .show_animated_inside(ui, self.show_controls, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.controls_ui(ui);
+                    });
                 });
-            });
+        } else {
+            egui::Panel::left("controls")
+                .resizable(true)
+                .default_size(320.0)
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.controls_ui(ui);
+                    });
+                });
+        }
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
             self.canvas_ui(ui);
@@ -249,8 +330,9 @@ impl NestApp {
         let running = self.engine.is_running();
         let units = self.units;
 
-        // Units & import scale (display units can change at any time).
-        ui.horizontal(|ui| {
+        // Units & import scale (display units can change at any time). Wrapped so
+        // the DPI presets flow onto a second row on a narrow phone screen.
+        ui.horizontal_wrapped(|ui| {
             ui.label("Units");
             egui::ComboBox::from_id_salt("units")
                 .selected_text(self.units.label())
@@ -462,15 +544,15 @@ impl NestApp {
             )
         };
 
-        // Sheets.
+        // Sheets (outline only).
         for s in &slots {
-            draw_ring(&painter, &s.polygon.outer, to_screen, None, egui::Color32::from_gray(70), 1.5);
+            draw_ring(&painter, &s.polygon.outer, to_screen, egui::Color32::from_gray(70), 1.5);
             for h in &s.polygon.holes {
-                draw_ring(&painter, h, to_screen, None, egui::Color32::from_gray(50), 1.0);
+                draw_ring(&painter, h, to_screen, egui::Color32::from_gray(50), 1.0);
             }
         }
 
-        // Placed parts.
+        // Placed parts: fill the outline minus holes, then stroke every ring.
         if let Some(best) = best {
             for pl in &best.placements {
                 let fill = egui::Color32::from_rgba_unmultiplied(
@@ -479,23 +561,10 @@ impl NestApp {
                     pl.color[2],
                     220,
                 );
-                draw_ring(
-                    &painter,
-                    &pl.polygon.outer,
-                    to_screen,
-                    Some(fill),
-                    egui::Color32::BLACK,
-                    1.0,
-                );
+                fill_polygon(&painter, &pl.polygon, to_screen, fill);
+                draw_ring(&painter, &pl.polygon.outer, to_screen, egui::Color32::BLACK, 1.0);
                 for h in &pl.polygon.holes {
-                    draw_ring(
-                        &painter,
-                        h,
-                        to_screen,
-                        Some(egui::Color32::from_gray(28)),
-                        egui::Color32::BLACK,
-                        0.5,
-                    );
+                    draw_ring(&painter, h, to_screen, egui::Color32::BLACK, 0.5);
                 }
             }
         }
@@ -684,11 +753,92 @@ fn length_drag(
     }
 }
 
+// ---- Demo shape builders (coordinates in millimetres) ----
+
+/// A convex regular polygon with `sides` vertices, centered on the origin.
+fn regular(sides: usize, r: f64, phase: f64) -> Vec<Pt> {
+    (0..sides)
+        .map(|i| {
+            let a = phase + TAU * (i as f64) / (sides as f64);
+            Pt::new(r * a.cos(), r * a.sin())
+        })
+        .collect()
+}
+
+/// A concave star with `points` spikes (alternating outer/inner radius).
+fn star(points: usize, r_out: f64, r_in: f64, phase: f64) -> Vec<Pt> {
+    (0..points * 2)
+        .map(|i| {
+            let a = phase + PI * (i as f64) / (points as f64);
+            let r = if i % 2 == 0 { r_out } else { r_in };
+            Pt::new(r * a.cos(), r * a.sin())
+        })
+        .collect()
+}
+
+/// A concave L-block of overall size `s`.
+fn l_block(s: f64) -> Vec<Pt> {
+    let t = s * 0.4;
+    vec![
+        Pt::new(0.0, 0.0),
+        Pt::new(s, 0.0),
+        Pt::new(s, t),
+        Pt::new(t, t),
+        Pt::new(t, s),
+        Pt::new(0.0, s),
+    ]
+}
+
+/// A concave plus/cross shape of overall size `s`.
+fn cross(s: f64) -> Vec<Pt> {
+    let a = s / 3.0;
+    vec![
+        Pt::new(a, 0.0),
+        Pt::new(2.0 * a, 0.0),
+        Pt::new(2.0 * a, a),
+        Pt::new(s, a),
+        Pt::new(s, 2.0 * a),
+        Pt::new(2.0 * a, 2.0 * a),
+        Pt::new(2.0 * a, s),
+        Pt::new(a, s),
+        Pt::new(a, 2.0 * a),
+        Pt::new(0.0, 2.0 * a),
+        Pt::new(0.0, a),
+        Pt::new(a, a),
+    ]
+}
+
+/// A concave arrow pointing right.
+fn arrow(len: f64, h: f64) -> Vec<Pt> {
+    let head = len * 0.45;
+    let shaft = h * 0.4;
+    let lo = h * 0.5 - shaft * 0.5;
+    let hi = h * 0.5 + shaft * 0.5;
+    vec![
+        Pt::new(0.0, lo),
+        Pt::new(len - head, lo),
+        Pt::new(len - head, 0.0),
+        Pt::new(len, h * 0.5),
+        Pt::new(len - head, h),
+        Pt::new(len - head, hi),
+        Pt::new(0.0, hi),
+    ]
+}
+
+/// An octagonal washer: a convex outer ring with a concentric octagonal hole,
+/// to exercise hole rendering and hole-aware nesting.
+fn washer(r: f64) -> Polygon {
+    Polygon {
+        outer: regular(8, r, PI / 8.0),
+        holes: vec![regular(8, r * 0.5, PI / 8.0)],
+    }
+}
+
+/// Stroke a closed ring outline.
 fn draw_ring(
     painter: &egui::Painter,
     ring: &[Pt],
     to_screen: impl Fn(Pt) -> egui::Pos2,
-    fill: Option<egui::Color32>,
     stroke: egui::Color32,
     width: f32,
 ) {
@@ -696,17 +846,32 @@ fn draw_ring(
         return;
     }
     let pts: Vec<egui::Pos2> = ring.iter().map(|&p| to_screen(p)).collect();
-    if let Some(fill) = fill {
-        // Approximate fill (egui tessellates simple polygons; concave shapes
-        // may show minor artifacts, acceptable for a live preview).
-        painter.add(egui::Shape::convex_polygon(
-            pts.clone(),
-            fill,
-            egui::Stroke::NONE,
-        ));
-    }
     painter.add(egui::Shape::closed_line(
         pts,
         egui::Stroke::new(width, stroke),
     ));
+}
+
+/// Fill a polygon (outer ring minus holes) with a solid color. Triangulated so
+/// concave outlines fill correctly and holes are cut out cleanly — no fan
+/// artifacts and no overpainting tricks.
+fn fill_polygon(
+    painter: &egui::Painter,
+    poly: &Polygon,
+    to_screen: impl Fn(Pt) -> egui::Pos2,
+    fill: egui::Color32,
+) {
+    let tris = crate::geometry::triangulate(&poly.outer, &poly.holes);
+    if tris.is_empty() {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    for tri in &tris {
+        let base = mesh.vertices.len() as u32;
+        for &p in tri {
+            mesh.colored_vertex(to_screen(p), fill);
+        }
+        mesh.add_triangle(base, base + 1, base + 2);
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }

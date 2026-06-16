@@ -313,11 +313,14 @@ pub fn contained_with_margin(inner: &Polygon, outer: &Polygon, margin: f64) -> b
             return false;
         }
     }
-    // No edge of inner may cross any ring of outer.
-    let inner_edges: Vec<(Pt, Pt)> = ring_edges(&inner.outer).collect();
+    // No edge of inner may cross any ring of outer. Iterate inner edges by index
+    // rather than collecting them, so this hot-path check allocates nothing.
+    let in_n = inner.outer.len();
     let check_ring = |ring: &[Pt]| -> bool {
         for (b1, b2) in ring_edges(ring) {
-            for &(a1, a2) in &inner_edges {
+            for i in 0..in_n {
+                let a1 = inner.outer[i];
+                let a2 = inner.outer[(i + 1) % in_n];
                 if segments_intersect(a1, a2, b1, b2) {
                     return false;
                 }
@@ -342,4 +345,242 @@ pub fn contained_with_margin(inner: &Polygon, outer: &Polygon, margin: f64) -> b
 /// Translate a copy of every point in `ring` and return a fresh ring.
 pub fn translate_ring(ring: &[Pt], dx: f64, dy: f64) -> Vec<Pt> {
     ring.iter().map(|p| Pt::new(p.x + dx, p.y + dy)).collect()
+}
+
+/// Triangulate a polygon (outer ring plus holes) into a list of triangles.
+///
+/// Uses ear clipping, with holes spliced into the outer contour by bridge edges
+/// (Eberly's method). Unlike a naive triangle fan, this is correct for *concave*
+/// outlines (no triangles spill outside the shape) and it cuts holes out cleanly
+/// (no triangles cover a hole). Returns triangles in the input coordinate space;
+/// degenerate input yields an empty list.
+pub fn triangulate(outer: &[Pt], holes: &[Vec<Pt>]) -> Vec<[Pt; 3]> {
+    if outer.len() < 3 {
+        return Vec::new();
+    }
+    let contour = merge_holes(outer, holes);
+    ear_clip(&contour)
+}
+
+/// Splice every hole into the outer ring, producing one simple (degenerate at the
+/// bridges) contour wound counter-clockwise. Holes are processed right-to-left so
+/// a bridge never has to cross a not-yet-merged hole.
+fn merge_holes(outer: &[Pt], holes: &[Vec<Pt>]) -> Vec<Pt> {
+    let mut contour: Vec<Pt> = outer.to_vec();
+    if ring_signed_area(&contour) < 0.0 {
+        contour.reverse(); // outer must be CCW
+    }
+    if holes.is_empty() {
+        return contour;
+    }
+
+    let mut holes: Vec<Vec<Pt>> = holes.to_vec();
+    for h in &mut holes {
+        if ring_signed_area(h) > 0.0 {
+            h.reverse(); // holes must wind opposite the outer ring (CW)
+        }
+    }
+    let max_x = |r: &[Pt]| r.iter().fold(f64::NEG_INFINITY, |m, p| m.max(p.x));
+    holes.sort_by(|a, b| max_x(b).partial_cmp(&max_x(a)).unwrap());
+
+    for hole in &holes {
+        bridge_hole(&mut contour, hole);
+    }
+    contour
+}
+
+/// Connect `hole` (assumed wound opposite to `contour`) into `contour` with a
+/// pair of coincident bridge edges to a mutually-visible outer vertex.
+fn bridge_hole(contour: &mut Vec<Pt>, hole: &[Pt]) {
+    // M: the hole's rightmost vertex — guaranteed to "see" rightward out of the hole.
+    let m = (0..hole.len())
+        .max_by(|&a, &b| hole[a].x.partial_cmp(&hole[b].x).unwrap())
+        .unwrap();
+    let mpt = hole[m];
+
+    // Cast a ray from M towards +x and find the nearest contour edge it hits.
+    let n = contour.len();
+    let mut ipt = Pt::new(f64::INFINITY, mpt.y);
+    let mut edge: Option<(usize, usize)> = None;
+    for e in 0..n {
+        let a = contour[e];
+        let b = contour[(e + 1) % n];
+        if (a.y > mpt.y) == (b.y > mpt.y) {
+            continue; // edge does not straddle M's horizontal line
+        }
+        let t = (mpt.y - a.y) / (b.y - a.y);
+        let ix = a.x + t * (b.x - a.x);
+        if ix >= mpt.x && ix < ipt.x {
+            ipt = Pt::new(ix, mpt.y);
+            edge = Some((e, (e + 1) % n));
+        }
+    }
+    let (e1, e2) = match edge {
+        Some(e) => e,
+        None => return, // hole not enclosed by the contour; skip it
+    };
+
+    // The bridge target starts at the edge endpoint with the larger x, but if any
+    // reflex vertex falls inside triangle (M, I, P) it may occlude P — pick the one
+    // closest in angle to the ray instead (the classic visibility refinement).
+    let p_init = if contour[e1].x > contour[e2].x { e1 } else { e2 };
+    let ppt = contour[p_init];
+    let mut visible = p_init;
+    let mut best_angle = f64::INFINITY;
+    for v in 0..n {
+        if v == p_init {
+            continue;
+        }
+        let vp = contour[v];
+        let prev = contour[(v + n - 1) % n];
+        let next = contour[(v + 1) % n];
+        let reflex = vp.sub(prev).cross(next.sub(vp)) < 0.0; // CCW contour => reflex when < 0
+        if reflex && point_in_tri(vp, mpt, ipt, ppt) {
+            let angle = (vp.y - mpt.y).atan2(vp.x - mpt.x).abs();
+            if angle < best_angle {
+                best_angle = angle;
+                visible = v;
+            }
+        }
+    }
+
+    // Splice after `visible`: P -> M -> (whole hole) -> M -> P.
+    let mut bridge: Vec<Pt> = Vec::with_capacity(hole.len() + 2);
+    for k in 0..=hole.len() {
+        bridge.push(hole[(m + k) % hole.len()]);
+    }
+    bridge.push(contour[visible]);
+    let at = visible + 1;
+    contour.splice(at..at, bridge);
+}
+
+/// Ear-clip a simple CCW contour into triangles.
+fn ear_clip(poly: &[Pt]) -> Vec<[Pt; 3]> {
+    let mut verts: Vec<Pt> = poly.to_vec();
+    if ring_signed_area(&verts) < 0.0 {
+        verts.reverse();
+    }
+    let mut idx: Vec<usize> = (0..verts.len()).collect();
+    let mut tris = Vec::with_capacity(verts.len().saturating_sub(2));
+
+    while idx.len() > 3 {
+        let n = idx.len();
+        let mut clipped = false;
+        for i in 0..n {
+            let ia = idx[(i + n - 1) % n];
+            let ib = idx[i];
+            let ic = idx[(i + 1) % n];
+            let (a, b, c) = (verts[ia], verts[ib], verts[ic]);
+            // Convex corner of a CCW polygon has a positive turn.
+            if b.sub(a).cross(c.sub(b)) <= 0.0 {
+                continue;
+            }
+            // An ear contains no other vertex of the polygon.
+            let mut is_ear = true;
+            for &j in &idx {
+                if j == ia || j == ib || j == ic {
+                    continue;
+                }
+                if strictly_inside_ccw(verts[j], a, b, c) {
+                    is_ear = false;
+                    break;
+                }
+            }
+            if is_ear {
+                tris.push([a, b, c]);
+                idx.remove(i);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            break; // degenerate remainder; give up gracefully
+        }
+    }
+    if idx.len() == 3 {
+        tris.push([verts[idx[0]], verts[idx[1]], verts[idx[2]]]);
+    }
+    tris
+}
+
+/// Strict interior test for a CCW triangle (a, b, c). Points on an edge or
+/// coincident with a vertex are *not* inside, so duplicate bridge vertices and
+/// shared edges never block a valid ear.
+fn strictly_inside_ccw(p: Pt, a: Pt, b: Pt, c: Pt) -> bool {
+    b.sub(a).cross(p.sub(a)) > 0.0
+        && c.sub(b).cross(p.sub(b)) > 0.0
+        && a.sub(c).cross(p.sub(c)) > 0.0
+}
+
+/// Point-in-triangle for a triangle of either winding (boundary counts as inside).
+fn point_in_tri(p: Pt, a: Pt, b: Pt, c: Pt) -> bool {
+    let d1 = b.sub(a).cross(p.sub(a));
+    let d2 = c.sub(b).cross(p.sub(b));
+    let d3 = a.sub(c).cross(p.sub(c));
+    let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(neg && pos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tri_area(t: &[Pt; 3]) -> f64 {
+        (t[1].sub(t[0]).cross(t[2].sub(t[0]))).abs() * 0.5
+    }
+
+    fn centroid(t: &[Pt; 3]) -> Pt {
+        Pt::new(
+            (t[0].x + t[1].x + t[2].x) / 3.0,
+            (t[0].y + t[1].y + t[2].y) / 3.0,
+        )
+    }
+
+    #[test]
+    fn triangulate_concave_covers_exactly() {
+        // An L-shape: strongly concave, so a naive fan would spill outside.
+        let outer = vec![
+            Pt::new(0.0, 0.0),
+            Pt::new(4.0, 0.0),
+            Pt::new(4.0, 1.0),
+            Pt::new(1.0, 1.0),
+            Pt::new(1.0, 4.0),
+            Pt::new(0.0, 4.0),
+        ];
+        let tris = triangulate(&outer, &[]);
+        let area: f64 = tris.iter().map(tri_area).sum();
+        assert!((area - ring_signed_area(&outer).abs()).abs() < 1e-9);
+        // Every triangle lies inside the shape (no spill).
+        for t in &tris {
+            assert!(point_in_ring(&outer, centroid(t)), "triangle outside shape");
+        }
+    }
+
+    #[test]
+    fn triangulate_respects_holes() {
+        let outer = vec![
+            Pt::new(0.0, 0.0),
+            Pt::new(10.0, 0.0),
+            Pt::new(10.0, 10.0),
+            Pt::new(0.0, 10.0),
+        ];
+        // A CCW inner ring (opposite winding is normalized internally).
+        let hole = vec![
+            Pt::new(3.0, 3.0),
+            Pt::new(7.0, 3.0),
+            Pt::new(7.0, 7.0),
+            Pt::new(3.0, 7.0),
+        ];
+        let tris = triangulate(&outer, &[hole.clone()]);
+        let area: f64 = tris.iter().map(tri_area).sum();
+        // 100 (outer) - 16 (hole) = 84.
+        assert!((area - 84.0).abs() < 1e-9, "area was {area}");
+        // No triangle covers the hole.
+        for t in &tris {
+            let c = centroid(t);
+            assert!(point_in_ring(&outer, c));
+            assert!(!point_in_ring(&hole, c), "triangle covers hole");
+        }
+    }
 }
