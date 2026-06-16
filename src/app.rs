@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use crate::geometry::{Aabb, Polygon, Pt};
-use crate::model::{NestConfig, Part, RotationMode};
+use crate::model::{NestConfig, Part, RotationMode, Unit};
 use crate::svg;
 use crate::worker::Engine;
 
@@ -19,7 +19,7 @@ pub struct NestApp {
     next_id: u64,
     color_cycle: usize,
 
-    // "Add rectangle" form.
+    // "Add rectangle" form (stored in mm).
     rect_w: f64,
     rect_h: f64,
     rect_as_sheet: bool,
@@ -27,6 +27,11 @@ pub struct NestApp {
     // Rotation UI helper.
     rot_steps: u32,
     rot_free: bool,
+
+    // Units handling.
+    units: Unit,
+    /// DPI assumed for SVGs that don't declare physical units (default 96).
+    import_dpi: f64,
 
     imports: ImportQueue,
     status: String,
@@ -58,6 +63,8 @@ impl Default for NestApp {
             rect_as_sheet: false,
             rot_steps: 4,
             rot_free: false,
+            units: Unit::Mm,
+            import_dpi: 96.0,
             imports: Arc::new(Mutex::new(Vec::new())),
             status: "Add parts and a sheet, then press Start.".to_string(),
         }
@@ -115,13 +122,19 @@ impl NestApp {
         self.next_id += 1;
     }
 
+    /// Millimetres per SVG user unit, given the assumed import DPI.
+    fn mm_per_unit(&self) -> f64 {
+        25.4 / self.import_dpi.max(1.0)
+    }
+
     fn drain_imports(&mut self) {
         let drained: Vec<(String, Vec<u8>)> = {
             let mut q = self.imports.lock().unwrap();
             std::mem::take(&mut *q)
         };
+        let scale = self.mm_per_unit();
         for (name, bytes) in drained {
-            match svg::import_svg(&bytes) {
+            match svg::import_svg(&bytes, scale) {
                 Some(poly) if !poly.is_empty() => {
                     self.add_polygon_part(poly, name.clone());
                     self.status = format!("Imported {name}");
@@ -217,6 +230,37 @@ impl eframe::App for NestApp {
 impl NestApp {
     fn controls_ui(&mut self, ui: &mut egui::Ui) {
         let running = self.engine.is_running();
+        let units = self.units;
+
+        // Units & import scale (display units can change at any time).
+        ui.horizontal(|ui| {
+            ui.label("Units");
+            egui::ComboBox::from_id_salt("units")
+                .selected_text(self.units.label())
+                .show_ui(ui, |ui| {
+                    for u in Unit::ALL {
+                        ui.selectable_value(&mut self.units, u, u.label());
+                    }
+                });
+            ui.separator();
+            ui.label("Import DPI")
+                .on_hover_text(
+                    "Pixels per inch assumed for SVGs without physical units.\n\
+                     Leave at 96: SVGs that declare mm/cm/in/pt (OpenSCAD, Inkscape,\n\
+                     Illustrator) import at their true real-world size.",
+                );
+            ui.add(
+                egui::DragValue::new(&mut self.import_dpi)
+                    .range(1.0..=100000.0)
+                    .speed(1.0),
+            );
+            for (lbl, dpi) in [("96", 96.0), ("72", 72.0), ("90", 90.0)] {
+                if ui.small_button(lbl).clicked() {
+                    self.import_dpi = dpi;
+                }
+            }
+        });
+        ui.separator();
 
         ui.add_enabled_ui(!running, |ui| {
             ui.collapsing("Add geometry", |ui| {
@@ -227,9 +271,9 @@ impl NestApp {
                 ui.label("Add rectangle:");
                 ui.horizontal(|ui| {
                     ui.label("w");
-                    ui.add(egui::DragValue::new(&mut self.rect_w).range(1.0..=100000.0));
+                    length_drag(ui, units, &mut self.rect_w, 1.0, 1.0e6, 1.0);
                     ui.label("h");
-                    ui.add(egui::DragValue::new(&mut self.rect_h).range(1.0..=100000.0));
+                    length_drag(ui, units, &mut self.rect_h, 1.0, 1.0e6, 1.0);
                 });
                 ui.checkbox(&mut self.rect_as_sheet, "Add as sheet");
                 if ui.button("➕ Add rectangle").clicked() {
@@ -242,19 +286,20 @@ impl NestApp {
             ui.collapsing("Settings", |ui| {
                 egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
                     ui.label("Part spacing");
-                    ui.add(egui::DragValue::new(&mut self.config.part_spacing).range(0.0..=1000.0).speed(0.1));
+                    length_drag(ui, units, &mut self.config.part_spacing, 0.0, 1000.0, 0.1);
                     ui.end_row();
 
                     ui.label("Edge spacing");
-                    ui.add(egui::DragValue::new(&mut self.config.edge_spacing).range(0.0..=1000.0).speed(0.1));
+                    length_drag(ui, units, &mut self.config.edge_spacing, 0.0, 1000.0, 0.1);
                     ui.end_row();
 
                     ui.label("Population");
                     ui.add(egui::DragValue::new(&mut self.config.population).range(4..=512));
                     ui.end_row();
 
-                    ui.label("Grid step");
-                    ui.add(egui::DragValue::new(&mut self.config.grid_step).range(0.25..=100.0).speed(0.1));
+                    ui.label("Grid step")
+                        .on_hover_text("Placement search resolution. Smaller = tighter packing but slower.");
+                    length_drag(ui, units, &mut self.config.grid_step, 0.25, 100.0, 0.1);
                     ui.end_row();
 
                     ui.label("Threads (0 = all)");
@@ -311,12 +356,15 @@ impl NestApp {
                             );
                         });
                         let b = p.bounds();
+                        let u = units;
                         ui.label(
                             egui::RichText::new(format!(
-                                "{:.0} × {:.0}   area {:.0}",
-                                b.width(),
-                                b.height(),
-                                p.area()
+                                "{:.2} × {:.2} {}   area {:.2} {}²",
+                                u.from_mm(b.width()),
+                                u.from_mm(b.height()),
+                                u.label(),
+                                p.area() * u.per_mm() * u.per_mm(),
+                                u.label(),
                             ))
                             .small()
                             .weak(),
@@ -434,6 +482,33 @@ impl NestApp {
                 }
             }
         }
+
+        // Scale bar: pick a "nice" round length close to ~90 px wide.
+        let target_mm = 90.0 / scale;
+        let target_disp = self.units.from_mm(target_mm);
+        let nice_disp = nice_number(target_disp);
+        let bar_mm = self.units.to_mm(nice_disp);
+        let bar_px = (bar_mm * scale) as f32;
+        let y = avail.max.y - 22.0;
+        let x0 = avail.min.x + 16.0;
+        let col = egui::Color32::from_gray(180);
+        painter.line_segment(
+            [egui::pos2(x0, y), egui::pos2(x0 + bar_px, y)],
+            egui::Stroke::new(2.0, col),
+        );
+        for dx in [0.0, bar_px] {
+            painter.line_segment(
+                [egui::pos2(x0 + dx, y - 4.0), egui::pos2(x0 + dx, y + 4.0)],
+                egui::Stroke::new(2.0, col),
+            );
+        }
+        painter.text(
+            egui::pos2(x0, y - 8.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{} {}", trim_float(nice_disp), self.units.label()),
+            egui::FontId::proportional(12.0),
+            col,
+        );
     }
 
     fn export(&mut self) {
@@ -538,6 +613,58 @@ fn download_text(filename: &str, text: &str, mime: &str) -> Option<()> {
     anchor.click();
     let _ = web_sys::Url::revoke_object_url(&url);
     Some(())
+}
+
+/// Round a positive value down to the nearest 1/2/5 × 10ⁿ ("nice") number,
+/// used for the scale bar.
+fn nice_number(v: f64) -> f64 {
+    if v <= 0.0 || !v.is_finite() {
+        return 1.0;
+    }
+    let exp = v.log10().floor();
+    let pow = 10f64.powf(exp);
+    let frac = v / pow;
+    let nice = if frac >= 5.0 {
+        5.0
+    } else if frac >= 2.0 {
+        2.0
+    } else {
+        1.0
+    };
+    nice * pow
+}
+
+/// Format a float without trailing zeros (e.g. `2.5`, `100`).
+fn trim_float(v: f64) -> String {
+    let s = format!("{v:.3}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
+}
+
+/// A [`egui::DragValue`] that edits a millimetre-valued field while displaying
+/// and accepting input in the user's chosen [`Unit`]. Ranges and speed are given
+/// in millimetres.
+fn length_drag(
+    ui: &mut egui::Ui,
+    unit: Unit,
+    value_mm: &mut f64,
+    lo_mm: f64,
+    hi_mm: f64,
+    speed_mm: f64,
+) {
+    let mut disp = unit.from_mm(*value_mm);
+    let lo = unit.from_mm(lo_mm);
+    let hi = unit.from_mm(hi_mm);
+    let speed = (speed_mm * unit.per_mm()).max(1.0e-4);
+    let resp = ui.add(
+        egui::DragValue::new(&mut disp)
+            .range(lo..=hi)
+            .speed(speed)
+            .suffix(unit.suffix()),
+    );
+    if resp.changed() {
+        *value_mm = unit.to_mm(disp);
+    }
 }
 
 fn draw_ring(

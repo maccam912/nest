@@ -3,17 +3,31 @@
 use crate::geometry::{Polygon, Pt, ring_signed_area, point_in_ring};
 use crate::model::{NestResult, SheetSlot};
 
-/// Parse SVG bytes into a single part polygon.
+/// Parse SVG bytes into a single part polygon, scaled to millimetres.
+///
+/// `usvg` resolves coordinates to px at its configured DPi (96), with physical
+/// units (`mm`/`cm`/`in`/`pt`) already converted. `mm_per_unit` scales those px
+/// into millimetres — pass `25.4 / dpi`. For SVGs that declare physical units,
+/// `dpi == 96` recovers their true real-world size.
 ///
 /// All sub-paths are flattened to line segments; the largest ring becomes the
 /// outer boundary and any rings fully contained within it become holes. Returns
 /// `None` if no usable geometry is found.
-pub fn import_svg(data: &[u8]) -> Option<Polygon> {
+pub fn import_svg(data: &[u8], mm_per_unit: f64) -> Option<Polygon> {
     let opt = usvg::Options::default();
     let tree = usvg::Tree::from_data(data, &opt).ok()?;
 
     let mut rings: Vec<Vec<Pt>> = Vec::new();
     collect_group(tree.root(), &mut rings);
+
+    if mm_per_unit != 1.0 {
+        for ring in &mut rings {
+            for p in ring {
+                p.x *= mm_per_unit;
+                p.y *= mm_per_unit;
+            }
+        }
+    }
 
     let mut rings: Vec<Vec<Pt>> = rings.into_iter().filter(|r| r.len() >= 3).collect();
     if rings.is_empty() {

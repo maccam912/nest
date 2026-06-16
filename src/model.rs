@@ -1,6 +1,57 @@
 //! Problem definition (parts, sheets, configuration) and result types.
+//!
+//! All geometry is stored internally in **millimetres**. The UI converts to/from
+//! the user's chosen display [`Unit`]; SVG import converts from SVG user units
+//! (px) using a DPI assumption (see `svg::import_svg`).
 
 use crate::geometry::{Aabb, Polygon, Pt};
+
+/// Display / input unit. Internally everything is millimetres.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    Mm,
+    Cm,
+    Inch,
+}
+
+impl Unit {
+    pub const ALL: [Unit; 3] = [Unit::Mm, Unit::Cm, Unit::Inch];
+
+    /// How many display units are in one millimetre.
+    pub fn per_mm(self) -> f64 {
+        match self {
+            Unit::Mm => 1.0,
+            Unit::Cm => 0.1,
+            Unit::Inch => 1.0 / 25.4,
+        }
+    }
+
+    /// Convert a millimetre value into this unit.
+    pub fn from_mm(self, mm: f64) -> f64 {
+        mm * self.per_mm()
+    }
+
+    /// Convert a value in this unit back to millimetres.
+    pub fn to_mm(self, v: f64) -> f64 {
+        v / self.per_mm()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Unit::Mm => "mm",
+            Unit::Cm => "cm",
+            Unit::Inch => "in",
+        }
+    }
+
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Unit::Mm => " mm",
+            Unit::Cm => " cm",
+            Unit::Inch => " in",
+        }
+    }
+}
 
 /// One library item the user has added. It is either a part to be nested
 /// (`is_sheet == false`) or a sheet to nest *into* (`is_sheet == true`).

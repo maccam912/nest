@@ -25,6 +25,30 @@ app **and** to WebAssembly for the browser.
   engine single-threaded, advancing each frame.
 - **Export** the best layout to SVG.
 
+## Units
+
+Internally everything is stored in **millimetres**. Two controls in the UI:
+
+- **Units** (mm / cm / in) — purely how values are shown and entered. A scale bar
+  in the canvas shows the current unit.
+- **Import DPI** (default 96) — only matters for SVGs that *don't* declare physical
+  units.
+
+How import scaling works: `usvg` resolves SVG coordinates to px at 96 DPI, converting
+any physical unit (`mm`, `cm`, `in`, `pt`) it finds in the document. On import we
+convert px → mm with `mm = px × 25.4 / DPI`. The upshot:
+
+| Source | Behaviour at 96 DPI |
+| --- | --- |
+| **OpenSCAD** (exports `width="…mm"`, 1 user unit = 1 mm) | imports at true size ✅ |
+| **Inkscape ≥ 0.92** (96 DPI, mm-aware) | true size ✅ |
+| **Illustrator / PDF** (points, "72 units per inch" = `pt`) | true size ✅ |
+| **Unit-less / px-only SVG** | treated as px; set Import DPI to taste |
+
+So for almost all real CAD/vector exports you can leave Import DPI at 96 and parts
+come in at their real-world dimensions. Only legacy unit-less files need adjustment
+(common presets: 96, 72, 90).
+
 ## Run the native app
 
 ```bash
