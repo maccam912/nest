@@ -192,23 +192,27 @@ impl NestApp {
         let mut rng = Rng::new(self.demo_seed);
         self.demo_seed = self.demo_seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
 
-        // Name + shape kind. Mix of convex, concave and one with a hole.
-        let kinds = [
-            "Triangle", "Pentagon", "Hexagon", "Star", "L-block", "Cross", "Washer", "Arrow",
+        // A mix of convex, concave and holed shapes...
+        let mut items: Vec<(String, Polygon)> = vec![
+            ("Triangle".into(), Polygon::from_points(regular(3, rng.range(26.0, 44.0), rng.range(0.0, TAU)))),
+            ("Pentagon".into(), Polygon::from_points(regular(5, rng.range(26.0, 44.0), rng.range(0.0, TAU)))),
+            ("Hexagon".into(), Polygon::from_points(regular(6, rng.range(26.0, 44.0), rng.range(0.0, TAU)))),
+            ("Star".into(), { let r = rng.range(30.0, 48.0); Polygon::from_points(star(5, r, r * 0.45, rng.range(0.0, TAU))) }),
+            ("L-block".into(), Polygon::from_points(l_block(rng.range(46.0, 70.0)))),
+            ("Cross".into(), Polygon::from_points(cross(rng.range(46.0, 70.0)))),
+            ("Washer".into(), washer(rng.range(28.0, 46.0))),
+            ("Arrow".into(), Polygon::from_points(arrow(rng.range(64.0, 96.0), rng.range(38.0, 54.0)))),
         ];
-        for (i, name) in kinds.iter().enumerate() {
-            let r = rng.range(28.0, 52.0);
-            let poly = match i {
-                0 => Polygon::from_points(regular(3, r, rng.range(0.0, TAU))),
-                1 => Polygon::from_points(regular(5, r, rng.range(0.0, TAU))),
-                2 => Polygon::from_points(regular(6, r, rng.range(0.0, TAU))),
-                3 => Polygon::from_points(star(5, r, r * 0.45, rng.range(0.0, TAU))),
-                4 => Polygon::from_points(l_block(r * 1.7)),
-                5 => Polygon::from_points(cross(r * 1.6)),
-                6 => washer(r),
-                _ => Polygon::from_points(arrow(r * 2.0, r * 1.3)),
-            };
-            self.add_polygon_part(poly, (*name).into());
+        // ...plus a few block letters spelling the app name.
+        for ch in ['N', 'E', 'S', 'T'] {
+            let poly = Polygon::from_points(letter(ch, rng.range(44.0, 62.0)));
+            items.push((format!("'{ch}'"), poly));
+        }
+
+        for (name, mut poly) in items {
+            // A little extra random scale so repeats and sizes feel varied.
+            scale_polygon(&mut poly, rng.range(0.8, 1.35));
+            self.add_polygon_part(poly, name);
             if let Some(p) = self.parts.last_mut() {
                 p.quantity = rng.below(3) as u32 + 1;
             }
@@ -834,6 +838,49 @@ fn washer(r: f64) -> Polygon {
     }
 }
 
+/// A rectilinear block-letter outline, sized to roughly `s`×`s` millimetres, as a
+/// single concave polygon (y grows downward so letters read upright on the
+/// canvas). Unknown characters fall back to a filled square.
+fn letter(ch: char, s: f64) -> Vec<Pt> {
+    let p = |x: f64, y: f64| Pt::new(x * s, y * s);
+    let t = 0.26; // stroke thickness as a fraction of the cell
+    let (m0, m1) = (0.5 - t * 0.5, 0.5 + t * 0.5); // middle-bar band
+    match ch {
+        'T' => vec![
+            p(0.0, 0.0), p(1.0, 0.0), p(1.0, t), p(0.5 + t * 0.5, t),
+            p(0.5 + t * 0.5, 1.0), p(0.5 - t * 0.5, 1.0), p(0.5 - t * 0.5, t), p(0.0, t),
+        ],
+        'E' => vec![
+            p(0.0, 0.0), p(1.0, 0.0), p(1.0, t), p(t, t), p(t, m0), p(1.0, m0),
+            p(1.0, m1), p(t, m1), p(t, 1.0 - t), p(1.0, 1.0 - t), p(1.0, 1.0), p(0.0, 1.0),
+        ],
+        'S' => vec![
+            p(0.0, 0.0), p(1.0, 0.0), p(1.0, t), p(t, t), p(t, m0), p(1.0, m0),
+            p(1.0, 1.0), p(0.0, 1.0), p(0.0, 1.0 - t), p(1.0 - t, 1.0 - t),
+            p(1.0 - t, m1), p(0.0, m1),
+        ],
+        'N' => vec![
+            p(0.0, 0.0), p(0.28, 0.0), p(0.72, 0.6), p(0.72, 0.0), p(1.0, 0.0),
+            p(1.0, 1.0), p(0.72, 1.0), p(0.28, 0.4), p(0.28, 1.0), p(0.0, 1.0),
+        ],
+        _ => vec![p(0.0, 0.0), p(1.0, 0.0), p(1.0, 1.0), p(0.0, 1.0)],
+    }
+}
+
+/// Scale a polygon (outer ring and holes) about the origin.
+fn scale_polygon(poly: &mut Polygon, f: f64) {
+    for pt in &mut poly.outer {
+        pt.x *= f;
+        pt.y *= f;
+    }
+    for h in &mut poly.holes {
+        for pt in h {
+            pt.x *= f;
+            pt.y *= f;
+        }
+    }
+}
+
 /// Stroke a closed ring outline.
 fn draw_ring(
     painter: &egui::Painter,
@@ -874,4 +921,29 @@ fn fill_polygon(
         mesh.add_triangle(base, base + 1, base + 2);
     }
     painter.add(egui::Shape::mesh(mesh));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{ring_signed_area, triangulate};
+
+    /// Each block letter must be a valid simple polygon: the ear-clipped area
+    /// equals the shoelace area (a self-intersecting outline would not match).
+    #[test]
+    fn demo_letters_are_simple_polygons() {
+        for ch in ['N', 'E', 'S', 'T'] {
+            let ring = letter(ch, 50.0);
+            let shoelace = ring_signed_area(&ring).abs();
+            assert!(shoelace > 0.0, "letter {ch} has no area");
+            let tri_area: f64 = triangulate(&ring, &[])
+                .iter()
+                .map(|t| (t[1].sub(t[0]).cross(t[2].sub(t[0]))).abs() * 0.5)
+                .sum();
+            assert!(
+                (tri_area - shoelace).abs() < 1e-6,
+                "letter {ch}: triangulated {tri_area} != shoelace {shoelace} (self-intersecting?)"
+            );
+        }
+    }
 }
